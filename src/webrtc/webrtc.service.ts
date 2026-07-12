@@ -1,6 +1,6 @@
 import { Redis } from "ioredis";
 import { ConfigService } from "@nestjs/config";
-import { Inject, Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable, Logger, OnModuleDestroy } from "@nestjs/common";
 import { WebRtcConfig } from "src/configs/types/WebRtcConfig";
 import nodeDataChannel, { PeerConnection } from "node-datachannel";
 import { RedisManagerService } from "src/redis/redis-manager/redis-manager.service";
@@ -8,9 +8,12 @@ import { ClientProxy } from "@nestjs/microservices";
 import { NetworkService } from "src/system/network.service";
 
 @Injectable()
-export class WebrtcService {
+export class WebrtcService implements OnModuleDestroy {
   private redis: Redis;
   private pcMap = new Map<string, PeerConnection>();
+  // Connections already closed, so a deferred "closed" state change from a
+  // connection that was replaced by a re-offer does not close it a second time.
+  private closedConnections = new WeakSet<PeerConnection>();
 
   constructor(
     private readonly configService: ConfigService,
@@ -25,12 +28,49 @@ export class WebrtcService {
     );
   }
 
+  // Close a specific PeerConnection and drop it from the map only if the map
+  // still points at it. The instance matters: a re-offer replaces the map entry
+  // under the same peerId, and node-datachannel delivers the previous
+  // connection's "closed" state change on a LATER tick, so a key-only lookup
+  // would tear down the new connection. Called with no `connection` (dedupe /
+  // shutdown) it targets whatever currently holds the key.
+  private closePeerConnection(peerId: string, connection?: PeerConnection) {
+    const target = connection ?? this.pcMap.get(peerId);
+    if (!target) {
+      return;
+    }
+    // Only evict the map entry if it is still this instance; a newer connection
+    // may already have taken the key.
+    if (this.pcMap.get(peerId) === target) {
+      this.pcMap.delete(peerId);
+    }
+    if (this.closedConnections.has(target)) {
+      return;
+    }
+    this.closedConnections.add(target);
+    try {
+      target.close();
+    } catch (error) {
+      this.logger.warn(`Failed to close peer connection ${peerId}`, error);
+    }
+  }
+
+  public onModuleDestroy() {
+    for (const [peerId, connection] of [...this.pcMap.entries()]) {
+      this.closePeerConnection(peerId, connection);
+    }
+  }
+
   public createPeerConnection(
     clientId: string,
     peerId: string,
     sessionId: string,
     region: string,
   ) {
+    // A re-offer for the same peer must not orphan the previous native
+    // connection (node-datachannel needs an explicit close to free resources).
+    this.closePeerConnection(peerId);
+
     const peerConnection = new nodeDataChannel.PeerConnection(peerId, {
       iceServers: [
         "stun:stun.l.google.com:19302",
@@ -39,6 +79,17 @@ export class WebrtcService {
         "stun:stun3.l.google.com:19302",
         "stun:stun4.l.google.com:19302",
       ],
+    });
+
+    // The latency test is short-lived; once the connection ends (or fails to
+    // establish) free the native resources and the map entry so they do not
+    // accumulate across every region test a client runs.
+    peerConnection.onStateChange((state) => {
+      if (state === "disconnected" || state === "failed" || state === "closed") {
+        // Close THIS connection specifically, not whatever currently holds the
+        // key (a re-offer may already have replaced it).
+        this.closePeerConnection(peerId, peerConnection);
+      }
     });
 
     peerConnection.onLocalDescription((description, type) => {
