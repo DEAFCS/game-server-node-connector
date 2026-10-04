@@ -9,6 +9,8 @@ import {
   FetchError,
 } from "@kubernetes/client-node";
 import * as child_process from "node:child_process";
+import * as fs from "node:fs";
+import { isLowLatencyNode } from "./lowLatency";
 import { NetworkService } from "src/system/network.service";
 import { ConfigService } from "@nestjs/config";
 import { NodeConfig } from "src/configs/types/NodeConfig";
@@ -297,7 +299,15 @@ export class KubernetesService {
         throw new Error("Could not get node info");
       }
 
-      return nodeInfo.kernelVersion.includes("lowlatency");
+      // /proc/cmdline inside a container is the host kernel's command line.
+      let commandLine: string | undefined;
+      try {
+        commandLine = fs.readFileSync("/proc/cmdline", "utf8");
+      } catch {
+        // Not readable (e.g. a non-Linux dev machine): the kernel name decides.
+      }
+
+      return isLowLatencyNode(nodeInfo.kernelVersion, commandLine);
     } catch (error) {
       this.logger.error("Error getting node kernel information:", error);
       throw error;
